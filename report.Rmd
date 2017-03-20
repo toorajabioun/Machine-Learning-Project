@@ -1,0 +1,125 @@
+---
+title: "Predicting How Good an Excercise is Performed"
+author: "Toor"
+date: "March 20, 2017"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##0) Introduction
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+
+##1) Loading, partitioning and Cleaning Data
+First, we load the training and testing datasets. The related files are placed in the working directory.
+```{r,cache=TRUE, warning=FALSE}
+library(parallel)
+library(doParallel)
+library(caret)
+library(e1071)
+training<-read.csv("pml-training.csv")
+testing<-read.csv("pml-testing.csv")
+ntrain <- length(training)
+```
+Now we will get rid of all the columns which are not usable in our predictions. These columns include the first 7 ones which are names and time stamps,.... we also delete the emty columns and the oned with number of NAs more than 20% of totall dataset size.
+```{r,cache=TRUE,warning=FALSE}
+#partitioning data
+set.seed(100)
+inTrain <- createDataPartition(training$classe,p=.7)
+#cleaning
+trainset <- training[inTrain[[1]],8:160]
+testset <- training[-inTrain[[1]],8:160]
+testing <- testing[,8:160]
+for (i in 152:1){
+  if (sum(is.na(trainset[,i])) >= ntrain*0.2 | is.na(mean(trainset[,i],na.rm = TRUE))){
+    trainset <- trainset[,-i]
+    testset <- testset[,-i]
+    testing <- testing[,-i]
+  }
+}
+```
+notice that we have two test sets:
+
+* testset : which we created by subsetting (30%) the original training set. We use this for cross validation
+
+* testing : which is provided by the problem, and our task is to predict it.
+
+##3) Preprocessing
+After cleaning the data, we are left with 52 features (predictors). These 52 features might be correlated. let's do some principle component analysis:
+```{r,cache=TRUE}
+#preprocessing
+summary(prcomp(trainset[,-53]))
+```
+as the pca shows, the first 10 PCs captures almost %96 percent of the variance. So we toss the remaining PCs. The data is also centered and scaled.
+```{r,cache=TRUE}
+train_pre_obj <- preProcess(trainset[,-ncol(trainset)],method = c("center","scale","pca"),pcaComp = 10)
+trainset.pre <- predict(train_pre_obj, newdata = trainset[,-ncol(trainset)])
+testset.pre <-  predict(train_pre_obj, newdata = testset[ ,-ncol(testset) ])
+testing.pre <-  predict(train_pre_obj, newdata = testing[ ,-ncol(testing) ])
+train.classe <- trainset$classe
+test.classe <- testset$classe
+```
+
+##4) Tranining Multiple Models
+Now we are ready to model our data. Since at this stage we are not sure that what is the best model for our data, We fit different models and later will compare their performance.
+```{r,cache=TRUE, warning=FALSE}
+#training different models:
+nc <- detectCores()
+fitControl <- trainControl(method="cv", number=8, allowParallel = TRUE)
+#Random Forest:
+cluster <- makeCluster(nc)
+registerDoParallel(cluster)
+m.rf <- train(x=trainset.pre, y=train.classe, method="rf", trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+#linear discrimant analysis:
+m.lda <- train(x=trainset.pre, y=train.classe, method="lda")
+#Gradient Boosting Algorithm:
+cluster <- makeCluster(nc)
+registerDoParallel(cluster)
+m.gbm <- train(x=trainset.pre, y=train.classe, method="gbm", trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+#Support Vector Machine:
+m.svm <- svm(x=trainset.pre, y=train.classe, method="svm")
+```
+In the above code, note that we used parallel computing for rf and gbm methods. The reason is training these models are computationally hard and takes a long time. So by using all the cores of the cpu we can reduce the running time.
+
+##5) Comparing Performance of the Models
+let's see which model is doing better on the preprocessed **testset**:
+```{r,cache=TRUE,warning=FALSE}
+#performance:
+rf.predicted <- predict(m.rf,testset.pre)
+lda.predicted <- predict(m.lda,testset.pre)
+gbm.predicted <- predict(m.gbm,testset.pre)
+svm.predicted <- predict(m.svm,testset.pre)
+confusionMatrix(test.classe,rf.predicted)$overall
+confusionMatrix(test.classe,lda.predicted)$overall
+confusionMatrix(test.classe,gbm.predicted)$overall
+confusionMatrix(test.classe,svm.predicted)$overall
+```
+Well, rf's performance is quite impresssive with %95 accuracy. The runner-ups are gbm, and svm. The lda method (with default setting) is not suitable for our data. 
+
+##6) stacking predictors
+Now, that we know rf, gbm, and svm are doing good on our testset, we can try stacking up these methods to have even better performance:
+```{r,cache=TRUE,warning=FALSE}
+#stacking predictors
+combined<-cbind(rf.predicted,gbm.predicted,svm.predicted)
+mc<-train(x=combined,y=test.classe,method="rf", trControl = fitControl)
+combined.predicted<-predict(mc,newdata=combined)
+confusionMatrix(test.classe,combined.predicted)$overall
+```
+the confusion matrix shows that the combined model is not better than the original rf on the testset. But no harm in keeping it.
+
+##7) Results:
+The following code will apply the combined model(rf+gbm+svm) to the testing set which consists of 20 instances:
+```{r,cache=TRUE,warning=FALSE}
+#output
+newdata<-cbind(predict(m.rf,testing.pre),predict(m.gbm,testing.pre),predict(m.svm,testing.pre))
+output<-predict(mc,newdata = newdata)
+print(output)
+```
